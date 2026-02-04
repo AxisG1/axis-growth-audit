@@ -327,8 +327,8 @@ export async function POST(req) {
     const data = parseCreditReport(text);
     const findings = runDetectionEngine(data);
 
-    return NextResponse.json({ findings, debug });
-  } catch (err) {
+    console.log('[PDF Debug]', debug);
+    return NextResponse.json(findings);  } catch (err) {
     return NextResponse.json(
       {
         error: 'Audit route failed',
