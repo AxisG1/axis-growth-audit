@@ -280,7 +280,7 @@ export async function GET(request) {
       return NextResponse.json({ error: 'Missing audit ID' }, { status: 400 });
     }
 
-    const auditDir = path.join(process.cwd(), 'tmp', 'audits', auditId);
+    const auditDir = path.join('/tmp', 'audits', auditId);
     if (!existsSync(auditDir)) {
       return NextResponse.json({ error: 'Audit not found' }, { status: 404 });
     }
