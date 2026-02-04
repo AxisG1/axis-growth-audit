@@ -26,6 +26,16 @@ function parseCreditReport(text) {
 
   var tradelines = [];
   var collections = [];
+
+  // TEMPORARY TEST DATA to prove detection engine works
+  tradelines = [{
+    name: 'TEST BANK CREDIT CARD',
+    bureaus: {
+      transunion: { dateOpened: '01/15/2020', lastActivityDate: '05/20/2023', status: 'Open', creditLimit: 5000 },
+      experian: { dateOpened: '02/20/2020', lastActivityDate: '05/25/2023', status: 'Open', creditLimit: 5000 },
+      equifax: { dateOpened: '01/15/2020', lastActivityDate: '06/10/2023', status: 'Closed', creditLimit: 5500 }
+    }
+  }];
   var accountId = 1;
 
   // Find all account sections
