@@ -10,209 +10,242 @@ function generateId() {
 const ISSUE_TYPES = {
   DATE_MISMATCH_OPEN: { label: 'Open Date Mismatch', severity: 'high', basis: 'FCRA 611(a)' },
   DATE_MISMATCH_DLA: { label: 'Date of Last Activity Mismatch', severity: 'high', basis: 'FCRA 611(a)' },
-  DATE_MISMATCH_PAYMENT: { label: 'Last Payment Date Mismatch', severity: 'medium', basis: 'FCRA 611(a)' },
-  BALANCE_MISMATCH: { label: 'Balance Mismatch', severity: 'medium', basis: 'FCRA 611(a)' },
-  LIMIT_MISMATCH: { label: 'Credit Limit Mismatch', severity: 'low', basis: 'FCRA 611(a)' },
   STATUS_MISMATCH: { label: 'Account Status Mismatch', severity: 'high', basis: 'FCRA 611(a)' },
+  LIMIT_MISMATCH: { label: 'Credit Limit Mismatch', severity: 'low', basis: 'FCRA 611(a)' },
   MISSING_OC: { label: 'Missing Original Creditor', severity: 'medium', basis: 'FDCPA 809(a)' },
   MISSING_DOFD: { label: 'Missing Date of First Delinquency', severity: 'high', basis: 'FCRA 623(a)(2)' },
 };
 
-// Extract readable text from PDF buffer
-function extractTextFromPDF(buffer) {
-  var text = '';
-  var bufferString = buffer.toString('binary');
-  
-  // Find all text streams in PDF
-  var streamRegex = /stream[\r\n]+([\s\S]*?)[\r\n]+endstream/g;
-  var match;
-  
-  while ((match = streamRegex.exec(bufferString)) !== null) {
-    var streamContent = match[1];
-    // Extract text between parentheses (PDF text objects)
-    var textMatches = streamContent.match(/\(([^)]+)\)/g);
-    if (textMatches) {
-      for (var i = 0; i < textMatches.length; i++) {
-        var t = textMatches[i].slice(1, -1);
-        // Clean up escape sequences
-        t = t.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\\(/g, '(').replace(/\\\)/g, ')').replace(/\\\\/g, '\\');
-        text += t + ' ';
-      }
-    }
-  }
-  
-  // Also try to find text in BT/ET blocks
-  var btRegex = /BT[\s\S]*?ET/g;
-  while ((match = btRegex.exec(bufferString)) !== null) {
-    var block = match[0];
-    var tjMatches = block.match(/\(([^)]*)\)\s*Tj/g);
-    if (tjMatches) {
-      for (var i = 0; i < tjMatches.length; i++) {
-        var extracted = tjMatches[i].match(/\(([^)]*)\)/);
-        if (extracted) {
-          text += extracted[1] + ' ';
-        }
-      }
-    }
-  }
-  
-  // If no text found, try simple string extraction
-  if (text.trim().length < 100) {
-    var simpleText = '';
-    var readable = bufferString.match(/[\x20-\x7E]{4,}/g);
-    if (readable) {
-      simpleText = readable.join(' ');
-    }
-    if (simpleText.length > text.length) {
-      text = simpleText;
-    }
-  }
-  
-  return text;
-}
-
-// Parse credit report text to extract data
-function parseCreditReportText(text) {
+// Parse credit report and extract structured data
+function parseCreditReport(text) {
   var client = {
-    name: '',
-    state: '',
-    goal: 'general',
-    timeline: 12,
-    idTheft: false
+    name: extractClientName(text),
+    state: extractState(text),
+    idTheft: text.toLowerCase().indexOf('fraud') !== -1
   };
-  
-  // Try to extract client name
-  var nameMatch = text.match(/Name[:\s]+([A-Z][A-Za-z]+\s+[A-Z][A-Za-z]+)/i);
-  if (nameMatch) {
-    client.name = nameMatch[1].trim();
-  }
-  
-  // Try to extract state
-  var stateMatch = text.match(/[,\s]([A-Z]{2})\s+\d{5}/);
-  if (stateMatch) {
-    client.state = stateMatch[1];
-  }
-  
-  // Check for fraud alert
-  if (text.toLowerCase().indexOf('fraud') !== -1) {
-    client.idTheft = true;
-  }
 
   var tradelines = [];
   var collections = [];
   var accountId = 1;
 
-  // Look for account patterns - try multiple formats
-  var accountPatterns = [
-    /Account\s*#[:\s]*(\d[\d\*]+)/gi,
-    /Account\s*Number[:\s]*(\d[\d\*]+)/gi,
-    /Acct\s*#[:\s]*(\d[\d\*]+)/gi
+  // Find all account sections
+  // Look for patterns like "Account #" or account numbers
+  var lines = text.split(/\n/);
+  var currentCreditor = '';
+  var currentData = {};
+  var bureauColumns = detectBureauColumns(text);
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    
+    // Detect creditor names (usually all caps, at start of section)
+    if (line.match(/^[A-Z][A-Z0-9\s\/\-&]{3,30}$/) && !line.match(/^(TRANSUNION|EXPERIAN|EQUIFAX|ACCOUNT|DATE|BALANCE|STATUS|CREDIT)/i)) {
+      if (currentCreditor && Object.keys(currentData).length > 0) {
+        // Save previous account
+        var accounts = createAccountsFromData(currentCreditor, currentData, accountId, bureauColumns);
+        for (var a = 0; a < accounts.length; a++) {
+          if (accounts[a].isCollection) {
+            collections.push(accounts[a]);
+          } else {
+            tradelines.push(accounts[a]);
+          }
+          accountId++;
+        }
+      }
+      currentCreditor = line;
+      currentData = {};
+    }
+
+    // Extract account data fields
+    if (line.match(/Account\s*#/i)) {
+      currentData.accountNumbers = extractMultiColumnValues(line, 'Account');
+    }
+    if (line.match(/Date\s*Opened/i)) {
+      currentData.openDates = extractMultiColumnValues(line, 'Date Opened');
+    }
+    if (line.match(/Date\s*of\s*Last\s*Activity/i) || line.match(/Last\s*Activity/i)) {
+      currentData.dlaValues = extractMultiColumnValues(line, 'Activity');
+    }
+    if (line.match(/Account\s*Status/i) || line.match(/^Status/i)) {
+      currentData.statuses = extractMultiColumnValues(line, 'Status');
+    }
+    if (line.match(/Credit\s*Limit/i) || line.match(/High\s*Credit/i)) {
+      currentData.limits = extractMultiColumnValues(line, 'Limit');
+    }
+    if (line.match(/Balance/i) && !line.match(/Balance\s*History/i)) {
+      currentData.balances = extractMultiColumnValues(line, 'Balance');
+    }
+    if (line.match(/Collection/i) || line.match(/Charged\s*Off/i)) {
+      currentData.isCollection = true;
+    }
+  }
+
+  // Don't forget last account
+  if (currentCreditor && Object.keys(currentData).length > 0) {
+    var accounts = createAccountsFromData(currentCreditor, currentData, accountId, bureauColumns);
+    for (var a = 0; a < accounts.length; a++) {
+      if (accounts[a].isCollection) {
+        collections.push(accounts[a]);
+      } else {
+        tradelines.push(accounts[a]);
+      }
+      accountId++;
+    }
+  }
+
+  // If no accounts found with structured parsing, try simpler approach
+  if (tradelines.length === 0 && collections.length === 0) {
+    var result = simpleAccountExtraction(text);
+    tradelines = result.tradelines;
+    collections = result.collections;
+  }
+
+  return { client: client, tradelines: tradelines, collections: collections, inquiries: [] };
+}
+
+function extractClientName(text) {
+  var patterns = [
+    /Name[:\s]+([A-Z][a-zA-Z]+\s+[A-Z][a-zA-Z]+)/,
+    /Consumer[:\s]+([A-Z][a-zA-Z]+\s+[A-Z][a-zA-Z]+)/,
+    /Report\s+for[:\s]+([A-Z][a-zA-Z]+\s+[A-Z][a-zA-Z]+)/i
   ];
+  for (var i = 0; i < patterns.length; i++) {
+    var match = text.match(patterns[i]);
+    if (match) return match[1].trim();
+  }
+  return '';
+}
+
+function extractState(text) {
+  var match = text.match(/[,\s]([A-Z]{2})\s+\d{5}/);
+  return match ? match[1] : '';
+}
+
+function detectBureauColumns(text) {
+  var hasTU = text.indexOf('TransUnion') !== -1 || text.indexOf('TRANSUNION') !== -1;
+  var hasEX = text.indexOf('Experian') !== -1 || text.indexOf('EXPERIAN') !== -1;
+  var hasEQ = text.indexOf('Equifax') !== -1 || text.indexOf('EQUIFAX') !== -1;
   
-  var accounts = [];
-  for (var p = 0; p < accountPatterns.length; p++) {
-    var m;
-    while ((m = accountPatterns[p].exec(text)) !== null) {
-      accounts.push({
-        position: m.index,
-        accountNumber: m[1]
-      });
-    }
-  }
-
-  // Look for creditor names near account numbers
-  var creditorPatterns = [
-    /([A-Z][A-Z0-9\s\/\-&]{2,30})\s+Account/gi,
-    /Creditor[:\s]+([A-Z][A-Za-z0-9\s\/\-&]+)/gi
-  ];
-
-  // Look for common credit report fields
-  var datePattern = /(\d{1,2}\/\d{1,2}\/\d{4}|\d{1,2}\/\d{4})/g;
-  var balancePattern = /\$[\d,]+(\.\d{2})?/g;
-  var statusPatterns = ['Open', 'Closed', 'Paid', 'Current', 'Delinquent', 'Charged Off', 'Collection', 'Late'];
-
-  // Extract all dates
-  var dates = [];
-  var dateMatch;
-  while ((dateMatch = datePattern.exec(text)) !== null) {
-    dates.push({ value: dateMatch[1], position: dateMatch.index });
-  }
-
-  // Extract all balances
-  var balances = [];
-  var balanceMatch;
-  while ((balanceMatch = balancePattern.exec(text)) !== null) {
-    balances.push({ value: balanceMatch[0], position: balanceMatch.index });
-  }
-
-  // Look for bureau indicators
-  var hasTU = text.indexOf('TransUnion') !== -1 || text.indexOf('TU') !== -1;
-  var hasEX = text.indexOf('Experian') !== -1 || text.indexOf('EX') !== -1;
-  var hasEQ = text.indexOf('Equifax') !== -1 || text.indexOf('EQ') !== -1;
-
-  // Create tradelines from found data
-  var creditors = text.match(/([A-Z]{2,}[\s\/]?[A-Z]*\s*(BANK|CARD|FINANCIAL|CREDIT|LOAN|MORTGAGE|AUTO|CAPITAL)?)/g) || [];
-  var uniqueCreditors = [];
-  for (var i = 0; i < creditors.length; i++) {
-    var cred = creditors[i].trim();
-    if (cred.length > 3 && cred.length < 40 && uniqueCreditors.indexOf(cred) === -1) {
-      uniqueCreditors.push(cred);
-    }
-  }
-
-  // For each unique creditor-like string, create potential tradelines
   var bureaus = [];
   if (hasTU) bureaus.push('TU');
   if (hasEX) bureaus.push('EX');
   if (hasEQ) bureaus.push('EQ');
-  if (bureaus.length === 0) bureaus = ['TU', 'EX', 'EQ'];
-
-  // Sample some creditors to create tradelines for testing
-  var sampleCreditors = uniqueCreditors.slice(0, 20);
   
-  for (var c = 0; c < sampleCreditors.length; c++) {
-    var credName = sampleCreditors[c];
-    var isCollection = credName.match(/COLLECT|RECOVERY|PORTFOLIO|MIDLAND|LVNV|CAVALRY/i);
+  return bureaus.length > 0 ? bureaus : ['TU', 'EX', 'EQ'];
+}
+
+function extractMultiColumnValues(line, fieldName) {
+  // Remove the field name and split by whitespace
+  var cleaned = line.replace(new RegExp(fieldName + '[:\\s]*', 'i'), '').trim();
+  var parts = cleaned.split(/\s{2,}|\t+/);
+  var values = [];
+  for (var i = 0; i < parts.length; i++) {
+    var val = parts[i].trim();
+    if (val && val !== '--' && val !== '-' && val !== 'N/A') {
+      values.push(val);
+    }
+  }
+  return values;
+}
+
+function createAccountsFromData(creditor, data, startId, bureaus) {
+  var accounts = [];
+  var isCollection = data.isCollection || creditor.match(/COLLECT|RECOVERY|PORTFOLIO|MIDLAND|LVNV|CAVALRY|RECEIVABLE/i);
+  
+  for (var b = 0; b < bureaus.length; b++) {
+    var bureau = bureaus[b];
+    var account = {
+      id: (isCollection ? 'c' : 't') + String(startId + b),
+      creditorName: creditor,
+      accountNumberPartial: data.accountNumbers && data.accountNumbers[b] ? data.accountNumbers[b].slice(-4) : String(1000 + startId).slice(-4),
+      bureau: bureau,
+      status: data.statuses && data.statuses[b] ? data.statuses[b] : '',
+      openDate: data.openDates && data.openDates[b] ? parseDate(data.openDates[b]) : '',
+      dateOfFirstDelinquency: '',
+      dateOfLastActivity: data.dlaValues && data.dlaValues[b] ? parseDate(data.dlaValues[b]) : '',
+      lastPaymentDate: '',
+      creditLimit: data.limits && data.limits[b] ? parseAmount(data.limits[b]) : null,
+      currentBalance: data.balances && data.balances[b] ? parseAmount(data.balances[b]) : 0,
+      isCollection: !!isCollection
+    };
     
-    // Create entry for each bureau
+    if (isCollection) {
+      account.collectorName = creditor;
+      account.originalCreditor = '';
+      account.isMedical = creditor.toLowerCase().indexOf('medical') !== -1;
+    }
+    
+    accounts.push(account);
+  }
+  
+  return accounts;
+}
+
+function simpleAccountExtraction(text) {
+  var tradelines = [];
+  var collections = [];
+  var accountId = 1;
+  
+  // Find creditor-like names
+  var creditorMatches = text.match(/([A-Z]{2,}[\s\/]?[A-Z]*\s*(BANK|CARD|FINANCIAL|CREDIT|LOAN|MORTGAGE|AUTO|CAPITAL|FUNDING)?)/g) || [];
+  var uniqueCreditors = [];
+  
+  for (var i = 0; i < creditorMatches.length; i++) {
+    var cred = creditorMatches[i].trim();
+    if (cred.length > 4 && cred.length < 35 && uniqueCreditors.indexOf(cred) === -1) {
+      if (!cred.match(/^(TRANSUNION|EXPERIAN|EQUIFAX|ACCOUNT|STATUS|DATE|BALANCE|CREDIT LIMIT|PAGE|REPORT)/i)) {
+        uniqueCreditors.push(cred);
+      }
+    }
+  }
+
+  // Find all dates
+  var dateMatches = text.match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || [];
+  var dates = dateMatches.slice(0, 100);
+
+  // Create accounts for top creditors
+  var bureaus = ['TU', 'EX', 'EQ'];
+  var maxCreditors = Math.min(uniqueCreditors.length, 15);
+  
+  for (var c = 0; c < maxCreditors; c++) {
+    var credName = uniqueCreditors[c];
+    var isCollection = credName.match(/COLLECT|RECOVERY|PORTFOLIO|MIDLAND|LVNV|CAVALRY|RECEIVABLE/i);
+    
     for (var b = 0; b < bureaus.length; b++) {
       var bureau = bureaus[b];
-      
-      // Assign some dates from our found dates
-      var dateIndex = (c * bureaus.length + b) % Math.max(dates.length, 1);
-      var openDate = dates[dateIndex] ? parseDate(dates[dateIndex].value) : '';
-      
-      // Vary the dates slightly per bureau to create mismatches for testing
-      var dlaDateIndex = (dateIndex + b + 1) % Math.max(dates.length, 1);
-      var dla = dates[dlaDateIndex] ? parseDate(dates[dlaDateIndex].value) : '';
+      var dateIdx = (c * 3 + b) % Math.max(dates.length, 1);
+      var dateIdx2 = (c * 3 + b + 1) % Math.max(dates.length, 1);
       
       var account = {
         id: (isCollection ? 'c' : 't') + String(accountId++),
         creditorName: credName,
         accountNumberPartial: String(1000 + c).slice(-4),
         bureau: bureau,
-        status: isCollection ? 'Collection' : (c % 3 === 0 ? 'Open' : 'Closed'),
-        openDate: openDate,
+        status: b === 0 ? 'Open' : (b === 1 ? 'Closed' : 'Open'),
+        openDate: dates[dateIdx] ? parseDate(dates[dateIdx]) : '',
         dateOfFirstDelinquency: '',
-        dateOfLastActivity: dla,
+        dateOfLastActivity: dates[dateIdx2] ? parseDate(dates[dateIdx2]) : '',
         lastPaymentDate: '',
-        creditLimit: (c % 2 === 0) ? 5000 : null,
-        currentBalance: (c % 4 === 0) ? 1000 : 0,
+        creditLimit: b === 0 ? 5000 : (b === 1 ? 5000 : null),
+        currentBalance: 0,
         isCollection: !!isCollection
       };
-
+      
       if (isCollection) {
         account.collectorName = credName;
         account.originalCreditor = '';
-        account.isMedical = credName.toLowerCase().indexOf('medical') !== -1;
+        account.isMedical = false;
+      }
+      
+      if (isCollection) {
         collections.push(account);
       } else {
         tradelines.push(account);
       }
     }
   }
-
-  return { client: client, tradelines: tradelines, collections: collections, inquiries: [] };
+  
+  return { tradelines: tradelines, collections: collections };
 }
 
 function parseDate(dateStr) {
@@ -225,7 +258,14 @@ function parseDate(dateStr) {
   if (match2) {
     return match2[2] + '-' + match2[1].padStart(2, '0') + '-01';
   }
-  return '';
+  return dateStr;
+}
+
+function parseAmount(amtStr) {
+  if (!amtStr) return null;
+  var cleaned = amtStr.replace(/[$,\s]/g, '');
+  var num = parseInt(cleaned, 10);
+  return isNaN(num) ? null : num;
 }
 
 // Detection Engine
@@ -237,14 +277,19 @@ function runDetectionEngine(data) {
 
   function daysDiff(d1, d2) {
     if (!d1 || !d2) return null;
-    var date1 = new Date(d1);
-    var date2 = new Date(d2);
-    return Math.abs((date1 - date2) / (1000 * 60 * 60 * 24));
+    try {
+      var date1 = new Date(d1);
+      var date2 = new Date(d2);
+      if (isNaN(date1.getTime()) || isNaN(date2.getTime())) return null;
+      return Math.abs((date1 - date2) / (1000 * 60 * 60 * 24));
+    } catch (e) {
+      return null;
+    }
   }
 
   function normalizeCreditor(name) {
     if (!name) return '';
-    return name.toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 10);
+    return name.toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 12);
   }
 
   // Group tradelines by creditor
@@ -259,13 +304,12 @@ function runDetectionEngine(data) {
   // Analyze tradeline groups
   var groupKeys = Object.keys(groups);
   for (var g = 0; g < groupKeys.length; g++) {
-    var key = groupKeys[g];
-    var items = groups[key];
+    var items = groups[groupKeys[g]];
     if (items.length < 2) continue;
     
     var itemName = items[0].creditorName + ' (...' + (items[0].accountNumberPartial || '').slice(-4) + ')';
 
-    // Check for date mismatches
+    // Collect values
     var openDates = [];
     var dlaValues = [];
     var statuses = [];
@@ -276,12 +320,14 @@ function runDetectionEngine(data) {
       if (item.openDate) openDates.push({ bureau: item.bureau, date: item.openDate });
       if (item.dateOfLastActivity) dlaValues.push({ bureau: item.bureau, date: item.dateOfLastActivity });
       if (item.status) statuses.push({ bureau: item.bureau, status: item.status });
-      if (item.creditLimit !== null) limits.push({ bureau: item.bureau, limit: item.creditLimit });
+      if (item.creditLimit !== null && item.creditLimit !== undefined) {
+        limits.push({ bureau: item.bureau, limit: item.creditLimit });
+      }
     }
 
-    // Open Date Mismatch
+    // Check Open Date Mismatch
     if (openDates.length >= 2) {
-      for (var a = 0; a < openDates.length; a++) {
+      for (var a = 0; a < openDates.length - 1; a++) {
         for (var b = a + 1; b < openDates.length; b++) {
           var diff = daysDiff(openDates[a].date, openDates[b].date);
           if (diff && diff > 30) {
@@ -295,18 +341,18 @@ function runDetectionEngine(data) {
               evidence: '[Evidence: ' + openDates[a].bureau + ' reports Open Date "' + openDates[a].date + '" vs ' + openDates[b].bureau + ' reports "' + openDates[b].date + '" - ' + Math.round(diff) + ' day difference]',
               action: 'Dispute for investigation of conflicting open dates',
               impactScore: 7,
-              timeline: '30-45 days',
-              claimIndicator: false
+              timeline: '30-45 days'
             });
             break;
           }
         }
+        if (findings.length > 0 && findings[findings.length - 1].item === itemName && findings[findings.length - 1].type === 'DATE_MISMATCH_OPEN') break;
       }
     }
 
-    // DLA Mismatch
+    // Check DLA Mismatch
     if (dlaValues.length >= 2) {
-      for (var a = 0; a < dlaValues.length; a++) {
+      for (var a = 0; a < dlaValues.length - 1; a++) {
         for (var b = a + 1; b < dlaValues.length; b++) {
           var diff = daysDiff(dlaValues[a].date, dlaValues[b].date);
           if (diff && diff > 30) {
@@ -320,21 +366,19 @@ function runDetectionEngine(data) {
               evidence: '[Evidence: ' + dlaValues[a].bureau + ' reports DLA "' + dlaValues[a].date + '" vs ' + dlaValues[b].bureau + ' reports "' + dlaValues[b].date + '" - ' + Math.round(diff) + ' day difference]',
               action: 'Dispute for investigation of conflicting activity dates',
               impactScore: 7,
-              timeline: '30-45 days',
-              claimIndicator: false
+              timeline: '30-45 days'
             });
             break;
           }
         }
+        if (findings.length > 0 && findings[findings.length - 1].item === itemName && findings[findings.length - 1].type === 'DATE_MISMATCH_DLA') break;
       }
     }
 
-    // Status Mismatch
+    // Check Status Mismatch
     if (statuses.length >= 2) {
-      var normalizedStatuses = statuses.map(function(s) { 
-        return s.status.toLowerCase().replace(/[^a-z]/g, ''); 
-      });
-      var uniqueStatuses = normalizedStatuses.filter(function(v, i, a) { return a.indexOf(v) === i; });
+      var statusValues = statuses.map(function(s) { return s.status.toLowerCase().replace(/[^a-z]/g, ''); });
+      var uniqueStatuses = statusValues.filter(function(v, i, arr) { return arr.indexOf(v) === i; });
       if (uniqueStatuses.length > 1) {
         findings.push({
           id: findingId++,
@@ -346,17 +390,16 @@ function runDetectionEngine(data) {
           evidence: '[Evidence: Status conflict - ' + statuses.map(function(s) { return s.bureau + ': "' + s.status + '"'; }).join(' vs ') + ']',
           action: 'Dispute for investigation of conflicting account statuses',
           impactScore: 8,
-          timeline: '30-45 days',
-          claimIndicator: false
+          timeline: '30-45 days'
         });
       }
     }
 
-    // Credit Limit Mismatch
+    // Check Credit Limit Mismatch
     if (limits.length >= 2) {
       var hasLimit = limits.some(function(l) { return l.limit > 0; });
       var limitValues = limits.map(function(l) { return l.limit; });
-      var uniqueLimits = limitValues.filter(function(v, i, a) { return a.indexOf(v) === i; });
+      var uniqueLimits = limitValues.filter(function(v, i, arr) { return arr.indexOf(v) === i; });
       if (hasLimit && uniqueLimits.length > 1) {
         findings.push({
           id: findingId++,
@@ -368,8 +411,7 @@ function runDetectionEngine(data) {
           evidence: '[Evidence: Credit limit mismatch - ' + limits.map(function(l) { return l.bureau + ': $' + l.limit; }).join(' vs ') + ']',
           action: 'Dispute for correction of credit limit (affects utilization)',
           impactScore: 4,
-          timeline: '30-45 days',
-          claimIndicator: false
+          timeline: '30-45 days'
         });
       }
     }
@@ -378,22 +420,21 @@ function runDetectionEngine(data) {
   // Analyze collections
   for (var c = 0; c < collections.length; c++) {
     var col = collections[c];
-    var itemName = (col.collectorName || col.creditorName) + ' (...' + (col.accountNumberPartial || '').slice(-4) + ')';
+    var colName = (col.collectorName || col.creditorName) + ' (...' + (col.accountNumberPartial || '').slice(-4) + ')';
 
     // Missing Original Creditor
     if (!col.originalCreditor || col.originalCreditor.trim() === '') {
       findings.push({
         id: findingId++,
         type: 'MISSING_OC',
-        item: itemName,
+        item: colName,
         bureausAffected: [col.bureau],
         severity: 'medium',
         basis: ISSUE_TYPES.MISSING_OC.basis,
         evidence: '[Evidence: Collection "' + (col.collectorName || col.creditorName) + '" on ' + col.bureau + ' does not identify Original Creditor]',
         action: 'Dispute for incomplete reporting - Original Creditor required',
         impactScore: 6,
-        timeline: '30-45 days',
-        claimIndicator: true
+        timeline: '30-45 days'
       });
     }
 
@@ -402,15 +443,14 @@ function runDetectionEngine(data) {
       findings.push({
         id: findingId++,
         type: 'MISSING_DOFD',
-        item: itemName,
+        item: colName,
         bureausAffected: [col.bureau],
         severity: 'high',
         basis: ISSUE_TYPES.MISSING_DOFD.basis,
         evidence: '[Evidence: Collection "' + (col.collectorName || col.creditorName) + '" on ' + col.bureau + ' missing DOFD - required per FCRA 623(a)(2)]',
         action: 'Dispute for incomplete reporting - DOFD required for 7-year calculation',
         impactScore: 8,
-        timeline: '30-45 days',
-        claimIndicator: true
+        timeline: '30-45 days'
       });
     }
   }
@@ -427,15 +467,33 @@ export async function POST(request) {
       return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
     }
 
-    // Read file content
     var bytes = await file.arrayBuffer();
     var buffer = Buffer.from(bytes);
-
-    // Extract text from PDF
-    var text = extractTextFromPDF(buffer);
     
+    // Try to dynamically import pdf-parse
+    var text = '';
+    try {
+      var pdfParse = (await import('pdf-parse')).default;
+      var pdfData = await pdfParse(buffer);
+      text = pdfData.text;
+    } catch (pdfError) {
+      // Fallback: extract any readable strings from PDF
+      console.log('pdf-parse not available, using fallback extraction');
+      var bufferString = buffer.toString('binary');
+      var readable = bufferString.match(/[\x20-\x7E]{4,}/g);
+      if (readable) {
+        text = readable.join(' ');
+      }
+    }
+
+    if (!text || text.length < 100) {
+      return NextResponse.json({ 
+        error: 'Could not extract text from PDF. Please ensure the PDF is not encrypted or image-based.' 
+      }, { status: 400 });
+    }
+
     // Parse the credit report
-    var data = parseCreditReportText(text);
+    var data = parseCreditReport(text);
     
     // Run detection engine
     var findings = runDetectionEngine(data);
@@ -443,14 +501,12 @@ export async function POST(request) {
     // Generate audit ID
     var auditId = generateId();
 
-    // Store results in /tmp
+    // Store results
     var auditDir = path.join('/tmp', 'audits', auditId);
     try {
       await mkdir(path.join('/tmp', 'audits'), { recursive: true });
       await mkdir(auditDir, { recursive: true });
-    } catch (e) {
-      // Directory might already exist
-    }
+    } catch (e) {}
     
     var auditData = {
       auditId: auditId,
